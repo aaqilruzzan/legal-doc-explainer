@@ -18,6 +18,20 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # --- API ENDPOINTS ---
 
+@app.route('/ping', methods=['GET'])
+def ping():
+    """
+    Health check endpoint to verify the server is running.
+    Returns server status and timestamp.
+    """
+    from datetime import datetime
+    return jsonify({
+        "status": "ok",
+        "message": "Legal Document Explainer API is running",
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.0.0"
+    }), 200
+
 @app.route('/analyze', methods=['POST'])
 def analyze_document():
     """
