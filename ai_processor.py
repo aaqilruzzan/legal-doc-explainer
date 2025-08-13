@@ -1,10 +1,10 @@
 import os
 import json
-import pinecone
+import time
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from langchain_pinecone import Pinecone as PineconeVectorStore # Aliased to avoid name conflicts
+from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
 from dotenv import load_dotenv
@@ -13,18 +13,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- INITIALIZATION ---
-# Load all keys and settings from environment variables
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-INDEX_NAME = "codestorm-legal-docs-v1"
 
-# Initialize the Pinecone client. It automatically uses the PINECONE_API_KEY from the environment.
-pc = pinecone.Pinecone()
-
-# Initialize LLMs and Embeddings
 extraction_llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model="gpt-4o-mini", temperature=0)
 analysis_llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model="gpt-4o-mini", temperature=0.3)
 embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+
+# In-memory dictionary to store FAISS indexes for the current session
+vector_stores = {}
 
 # --- HELPER FUNCTIONS FOR ANALYSIS ---
 
@@ -45,17 +41,39 @@ def highlight_key_clauses(retriever):
         "Penalties for late payment or breach of contract",
         "Conditions for contract termination (by either party)",
         "Terms related to auto-renewal of the contract",
-        "Confidentiality obligations", "Limitations of liability",
+        "Confidentiality obligations",
+        "Limitations of liability",
         "Governing law and jurisdiction for disputes"
     ]
     highlighted_clauses = {}
-    qa_chain = RetrievalQA.from_chain_type(llm=extraction_llm, chain_type="stuff", retriever=retriever)
+    
     for clause_topic in CLAUSE_CHECKLIST:
-        prompt = f"Extract the exact clause from the document that specifically addresses '{clause_topic}'. If not found, respond with 'Not Found'."
-        response = qa_chain.invoke(prompt)
-        # Access the result correctly from the dictionary and always store the result
-        result = response.get('result', '').strip()
-        highlighted_clauses[clause_topic] = result
+        print(f"INFO: Retrieving context for: {clause_topic}")
+        retrieved_docs = retriever.invoke(clause_topic)
+        
+        if not retrieved_docs:
+            print(f"WARN: No context found for '{clause_topic}'. Skipping.")
+            highlighted_clauses[clause_topic] = "Not Found"
+            continue
+
+        context_text = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
+
+        prompt = f"""
+        Based ONLY on the following context, extract the exact, verbatim clause or sentences that specifically address '{clause_topic}'.
+        If no relevant clause is found within this context, respond with ONLY the text 'Not Found'.
+
+        Context: --- {context_text} ---
+        """
+        
+        print(f"INFO: Extracting clause for: {clause_topic}")
+        response_content = extraction_llm.invoke(prompt).content
+        result = response_content.strip()
+
+        if "not found" not in result.lower():
+            highlighted_clauses[clause_topic] = result
+        else:
+            highlighted_clauses[clause_topic] = "Not Found"
+            
     return highlighted_clauses
 
 def analyze_for_red_flags(clauses_text):
@@ -85,44 +103,44 @@ def get_final_assessment(full_document_text, red_flags_summary):
 # --- MAIN PUBLIC FUNCTIONS ---
 
 def setup_and_process_document(filepath):
-    """Orchestrates the entire document processing and analysis workflow."""
+    """Orchestrates the entire document processing and analysis workflow using FAISS."""
     # 1. Load and Chunk Document
     loader = PyMuPDFLoader(filepath)
     documents = loader.load()
     full_text = " ".join([doc.page_content for doc in documents])
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = text_splitter.split_documents(documents)
-
-    # 2. Create or Update Pinecone Index
     doc_namespace = os.path.basename(filepath)
-    # The new way to check if an index exists
-    if INDEX_NAME not in pc.list_indexes().names():
-        from pinecone import ServerlessSpec
-        pc.create_index(
-            name=INDEX_NAME,
-            dimension=1536, # Standard for OpenAI embeddings
-            metric='cosine',
-            spec=ServerlessSpec(cloud='aws', region='us-east-1')
-        )
 
-    # Use the aliased PineconeVectorStore class
-    vector_store = PineconeVectorStore.from_documents(chunks, embeddings, index_name=INDEX_NAME, namespace=doc_namespace)
-    retriever = vector_store.as_retriever()
+    # 2. Create FAISS index in memory
+    print(f"INFO: Creating FAISS index for {doc_namespace}...")
+    try:
+        vector_store = FAISS.from_documents(chunks, embeddings)
+        vector_stores[doc_namespace] = vector_store # Store the index in our global dictionary
+        print(f"SUCCESS: FAISS index created and stored for {doc_namespace}.")
+    except Exception as e:
+        print(f"ERROR: Failed to create FAISS index: {e}")
+        return {"error": "Could not process the document."}
+
+    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
 
     # 3. Run the Full Analysis Chain
     summary = get_simple_summary(full_text)
     highlighted_clauses = highlight_key_clauses(retriever)
-    # clauses_text_for_analysis = "\n\n".join(f"Topic: {k}\nClause: {v}" for k, v in highlighted_clauses.items())
-    # red_flags = analyze_for_red_flags(clauses_text_for_analysis)
-    # final_assessment = get_final_assessment(full_text, red_flags)
+    
+    found_clauses = {k: v for k, v in highlighted_clauses.items() if v != "Not Found"}
+    clauses_text_for_analysis = "\n\n".join(f"Topic: {k}\nClause: {v}" for k, v in found_clauses.items())
+    
+    red_flags = analyze_for_red_flags(clauses_text_for_analysis)
+    final_assessment = get_final_assessment(full_text, red_flags)
 
     # 4. Compile and Return Results
     return {
         "summary": summary,
         "namespace": doc_namespace,
         "highlighted_clauses": highlighted_clauses,
-        # "red_flags_summary": red_flags,
-        # "final_assessment": final_assessment
+        "red_flags_summary": red_flags,
+        "final_assessment": final_assessment
     }
 
 def ask_question(query, namespace):
@@ -130,11 +148,13 @@ def ask_question(query, namespace):
     if not namespace:
         return "Error: No document namespace provided."
 
-    # Use the aliased PineconeVectorStore class
-    vector_store = PineconeVectorStore.from_existing_index(index_name=INDEX_NAME, embedding=embeddings, namespace=namespace)
+    # Retrieve the correct FAISS index from our in-memory store
+    vector_store = vector_stores.get(namespace)
+    if not vector_store:
+        return "Error: Document has not been processed or session has expired."
+
     retriever = vector_store.as_retriever()
     qa_chain = RetrievalQA.from_chain_type(llm=extraction_llm, chain_type="stuff", retriever=retriever)
 
-    # Use .invoke for the new LangChain versions and access the result
     response = qa_chain.invoke(query)
     return response.get('result', 'No answer found.')
