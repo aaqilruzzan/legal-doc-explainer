@@ -24,16 +24,79 @@ vector_stores = {}
 
 # --- HELPER FUNCTIONS FOR ANALYSIS ---
 
-def get_simple_summary(full_document_text):
-    """Creates a simple, easy-to-understand summary of the entire document."""
-    prompt = f"""Provide a clear, easy-to-understand summary of the following legal document. The summary should:
-    1. Use plain, simple language and avoid legal jargon.
-    2. Include clear headings for different sections (e.g., "Key Responsibilities").
-    3. Focus on the most important aspects of the agreement.
-
-    Document Text: --- {full_document_text} ---
+def get_summary_and_key_data(full_document_text):
     """
-    return analysis_llm.invoke(prompt).content
+    Extracts a summary, key data points, important contract terms, and a glossary in a single LLM call.
+    """
+    prompt = f"""
+    Analyze the following legal document and provide four things in a single JSON object:
+    1. A summary, generated according to the specific instructions provided.
+    2. A structured extraction of key data points.
+    3. A structured extraction of important contract terms.
+    4. A glossary of important legal terms found in the document.
+
+    Return ONLY a valid JSON object with four top-level keys: "summary", "key_data_points", "important_contract_terms", and "legal_terms_glossary". Do not add any text before or after the JSON.
+
+    INSTRUCTIONS FOR THE "summary" VALUE:
+    Provide a clear, easy-to-understand summary of the document. The summary MUST:
+    - Use plain, simple language and avoid legal jargon.
+    - Include clear headings for different sections and number them (e.g., "1. Key Responsibilities"). Do not number sub-headings or points.
+    
+    Example for the "summary" value:
+    "summary": "1. What This Agreement Is About\\nThis is a service agreement where ABC Company agrees to provide marketing services to XYZ Corporation for a period of one year.\\n\\n2. Key Responsibilities\\nAs the Client, you are responsible for providing necessary materials and feedback in a timely manner. Payments are due on the first of each month."
+
+    INSTRUCTIONS FOR THE "key_data_points" VALUE:
+    This should be an object with the following structure. Be as specific as possible. If a value is not found, use an empty string "" or an empty list [].
+    {{
+      "parties_involved": [ {{ "name": "Name", "role": "Role" }} ],
+      "contract_period": {{
+        "start_date": "Extract the specific start date in YYYY-MM-DD format or leave blank if not found.",
+        "end_date": "Extract the specific end date in YYYY-MM-DD format or leave blank if not found.",
+        "term_description": "Provide a specific description, e.g., 'A 2-year initial term with an option for one 12-month renewal.'"
+      }},
+      "financial_terms": [
+        "Extract specific amounts, fees, and percentages. e.g., '$5,000 monthly subscription fee', '1.5% late fee on overdue payments'"
+      ],
+      "key_deadlines": [ "e.g., 30-day termination notice" ]
+    }}
+
+    INSTRUCTIONS FOR THE "important_contract_terms" VALUE:
+    This should be an object containing key-value pairs for high-level contract terms. If a term is not found, use an empty string "".
+    Example:
+    {{
+      "Service Scope": "Consulting services as defined in Exhibit A",
+      "Confidentiality": "Standard NDA provisions apply",
+      "Governing Law": "Delaware State Law",
+      "Intellectual Property": "Work product ownership defined"
+    }}
+
+    INSTRUCTIONS FOR THE "legal_terms_glossary" VALUE:
+    This should be an object containing key-value pairs. The key should be 5 complex legal terms found in the document, and the value should be its simple definition.
+    Example:
+    {{
+        "Force Majeure": "Unforeseeable circumstances that prevent a party from fulfilling a contract.",
+        "Indemnification": "Protection against financial loss, typically through compensation."
+    }}
+
+    Document Text to Analyze:
+    ---
+    {full_document_text}
+    ---
+    """
+    response_content = analysis_llm.invoke(prompt).content
+    try:
+        cleaned_json = response_content.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned_json)
+    except json.JSONDecodeError:
+        print("ERROR: Failed to parse summary and key data points JSON from LLM.")
+        return {
+            "summary": "Could not generate a summary for this document.",
+            "key_data_points": {"error": "Failed to extract key data points."},
+            "important_contract_terms": {"error": "Failed to extract important contract terms."},
+            "legal_terms_glossary": {"error": "Failed to generate legal terms glossary."}
+        }
+
+
 
 def highlight_key_clauses(retriever):
     """Uses a retriever to find and extract specific, important clause types."""
@@ -125,22 +188,19 @@ def setup_and_process_document(filepath):
     retriever = vector_store.as_retriever(search_kwargs={"k": 5})
 
     # 3. Run the Full Analysis Chain
-    summary = get_simple_summary(full_text)
-    highlighted_clauses = highlight_key_clauses(retriever)
+    summary = get_summary_and_key_data(full_text)
+    # highlighted_clauses = highlight_key_clauses(retriever)
     
-    found_clauses = {k: v for k, v in highlighted_clauses.items() if v != "Not Found"}
-    clauses_text_for_analysis = "\n\n".join(f"Topic: {k}\nClause: {v}" for k, v in found_clauses.items())
+    # found_clauses = {k: v for k, v in highlighted_clauses.items() if v != "Not Found"}
+    # clauses_text_for_analysis = "\n\n".join(f"Topic: {k}\nClause: {v}" for k, v in found_clauses.items())
     
-    red_flags = analyze_for_red_flags(clauses_text_for_analysis)
-    final_assessment = get_final_assessment(full_text, red_flags)
+    # red_flags = analyze_for_red_flags(clauses_text_for_analysis)
+    # final_assessment = get_final_assessment(full_text, red_flags)
 
     # 4. Compile and Return Results
     return {
         "summary": summary,
-        "namespace": doc_namespace,
-        "highlighted_clauses": highlighted_clauses,
-        "red_flags_summary": red_flags,
-        "final_assessment": final_assessment
+       
     }
 
 def ask_question(query, namespace):
