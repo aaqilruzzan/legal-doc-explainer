@@ -7,6 +7,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -48,7 +49,7 @@ def get_summary_and_key_data(full_document_text):
     INSTRUCTIONS FOR THE "key_data_points" VALUE:
     This should be an object with the following structure. Be as specific as possible. If a value is not found, use an empty string "" or an empty list [].
     {{
-      "parties_involved": [ {{ "name": "Name", "role": "Role" }} ],
+      "parties_involved": [ {{ "name": "Name", "role": "Role (use simple role names like 'Provider', 'Customer', 'Contractor' without additional descriptive text in parentheses)" }} ],
       "contract_period": {{
         "start_date": "Extract the specific start date in YYYY-MM-DD format or leave blank if not found.",
         "end_date": "Extract the specific end date in YYYY-MM-DD format or leave blank if not found.",
@@ -200,21 +201,61 @@ def setup_and_process_document(filepath):
     # 4. Compile and Return Results
     return {
         "summary": summary,
-       
+        "namespace": doc_namespace
     }
 
 def ask_question(query, namespace):
+    print("reached")
     """Handles follow-up Q&A for a specific, already-processed document."""
     if not namespace:
         return "Error: No document namespace provided."
 
-    # Retrieve the correct FAISS index from our in-memory store
     vector_store = vector_stores.get(namespace)
     if not vector_store:
         return "Error: Document has not been processed or session has expired."
 
     retriever = vector_store.as_retriever()
-    qa_chain = RetrievalQA.from_chain_type(llm=extraction_llm, chain_type="stuff", retriever=retriever)
 
-    response = qa_chain.invoke(query)
+   # --- NEW: DEFINE A CUSTOM PROMPT --- 📝
+
+    # 1. Create a detailed prompt template string.
+    #    This gives the LLM a role, clear instructions, and specifies how to handle missing info.
+    prompt_template = """
+    You are a helpful assistant analyzing a document. Use the following pieces of context to answer the question at the end.
+    Your answer should be based ONLY on the provided context.
+
+    If the answer is found in the context, provide a clear and concise answer.
+    If the answer is not found in the context, explicitly state "The provided document does not contain specific information on this topic."
+
+    Context:
+    {context}
+
+    Question: {question}
+
+    Answer:
+    """
+
+    # 2. Create the PromptTemplate object
+    QA_PROMPT = PromptTemplate(
+        template=prompt_template, input_variables=["context", "question"]
+    )
+
+    # 3. Create the chain, passing in the custom prompt via `chain_type_kwargs`
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=extraction_llm,
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=True,  # Optional: returns the source chunks used for the answer
+        chain_type_kwargs={"prompt": QA_PROMPT}
+    )
+
+    # --- END NEW SECTION ---
+
+    response = qa_chain.invoke({"query": query})
+
+    # The 'result' is the main answer. 'source_documents' shows what context was used.
+    print("--- Source Documents Used ---")
+    print(response.get('source_documents', 'No source documents found.'))
+    print("----------------------------")
+    
     return response.get('result', 'No answer found.')
