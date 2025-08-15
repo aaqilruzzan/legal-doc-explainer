@@ -4,6 +4,8 @@ Utility functions for the Legal Document Explainer.
 import os
 import logging
 from werkzeug.utils import secure_filename
+import json
+from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -76,3 +78,30 @@ def log_error_and_return(error_msg, status_code=500):
     """
     logger.error(error_msg)
     return {"error": error_msg}, status_code
+
+
+def parse_json_response(response_content: str) -> Dict[str, Any]:
+    """Parse JSON response from LLM, handling common formatting issues."""
+    try:
+        cleaned_json = response_content.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned_json)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON: {str(e)}")
+        return {"error": f"Failed to parse response: {str(e)}"}
+
+def create_error_response(error_message: str) -> Dict[str, Any]:
+    """Create a standardized error response."""
+    return {
+        "summary": "Could not generate a summary for this document.",
+        "key_data_points": {"error": "Failed to extract key data points."},
+        "important_contract_terms": {"error": "Failed to extract important contract terms."},
+        "legal_terms_glossary": {"error": "Failed to generate legal terms glossary."}
+    }
+
+def safe_execute(func, *args, **kwargs):
+    """Execute function with error handling and logging."""
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"Error executing {func.__name__}: {str(e)}")
+        raise
