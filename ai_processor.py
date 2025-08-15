@@ -1,166 +1,210 @@
 import os
-import json
-import pinecone
-from langchain.document_loaders import PyMuPDFLoader
+import logging
+from typing import Dict, Any, Optional
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import Pinecone
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
-from dotenv import load_dotenv
+from langchain.prompts import PromptTemplate
+from langchain.output_parsers import PydanticOutputParser
 
-# Load environment variables from .env file
-load_dotenv()
-
-# --- INITIALIZATION ---
-# Configuration for API keys and environment variables
-PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
-PINECONE_ENV = os.environ.get("PINECONE_ENV")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-# Initialize Pinecone
-pinecone.init(
-    api_key=PINECONE_API_KEY,
-    environment=PINECONE_ENV
+from config import (
+    OPENAI_API_KEY, EXTRACTION_MODEL, ANALYSIS_MODEL, 
+    EXTRACTION_TEMPERATURE, ANALYSIS_TEMPERATURE, 
+    CHUNK_SIZE, CHUNK_OVERLAP, RETRIEVAL_K
 )
+from constants import (
+    CLAUSE_TOPICS, SUMMARY_PROMPT_TEMPLATE, 
+    QA_PROMPT_TEMPLATE, CLAUSE_ANALYSIS_TEMPLATE
+)
+from utils import parse_json_response, create_error_response, safe_execute
+from schemas import ClauseDetail, ClauseAnalysis
 
-# Define a unique name for your Pinecone index
-INDEX_NAME = "codestorm-legal-docs-v1"
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Initialize LLMs and Embeddings
-# Using different models for different tasks can be cost-effective.
-# gpt-3.5-turbo is fast and cheap for extraction.
-# gpt-4 is better for nuanced analysis.
-extraction_llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name="gpt-3.5-turbo", temperature=0)
-analysis_llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name="gpt-4", temperature=0.3)
+# Initialize AI models
+extraction_llm = ChatOpenAI(
+    openai_api_key=OPENAI_API_KEY, 
+    model=EXTRACTION_MODEL, 
+    temperature=EXTRACTION_TEMPERATURE
+)
+analysis_llm = ChatOpenAI(
+    openai_api_key=OPENAI_API_KEY, 
+    model=ANALYSIS_MODEL, 
+    temperature=ANALYSIS_TEMPERATURE
+)
 embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 
-# --- HELPER FUNCTIONS FOR ANALYSIS ---
+# In-memory storage
+vector_stores: Dict[str, FAISS] = {}
 
-def get_simple_summary(full_document_text):
-    """Creates a simple, easy-to-understand summary of the entire document."""
-    # Create a prompt for document summarization
-    prompt = f"""Provide a clear, easy-to-understand summary of the following legal document. The summary should:
-    1. Use plain, simple language.
-    2. Avoid legal jargon.
-    3. Include clear headings for different sections.
-    4. Focus on the most important aspects of the agreement.
-
-    Document Text:
-    ---
-    {full_document_text}
-    ---
-    """
-    return analysis_llm.predict(prompt)
-
-def highlight_key_clauses(retriever):
-    """Uses a retriever to find and extract specific, important clause types."""
-    # Define a checklist of important clause types to look for
-    CLAUSE_CHECKLIST = [
-        "Penalties for late payment or breach of contract",
-        "Conditions for contract termination (by either party)",
-        "Terms related to auto-renewal of the contract",
-        "Confidentiality obligations",
-        "Limitations of liability",
-        "Governing law and jurisdiction for disputes"
-    ]
-    highlighted_clauses = {}
-    qa_chain = RetrievalQA.from_chain_type(llm=extraction_llm, chain_type="stuff", retriever=retriever)
-
-    # Process each clause type in the checklist
-    for clause_topic in CLAUSE_CHECKLIST:
-        prompt = f"Extract the exact clause or sentences from the document that specifically address '{clause_topic}'. If not found, respond with 'Not Found'."
-        response = qa_chain.run(prompt)
-        if "not found" not in response.lower():
-            highlighted_clauses[clause_topic] = response
-    return highlighted_clauses
-
-def analyze_for_red_flags(clauses_text):
-    """Takes a string of extracted clauses and analyzes them for risks."""
-    # Handle case where no clauses were found
-    if not clauses_text:
-        return "No specific clauses were identified for risk analysis."
+class DocumentProcessor:
+    """Handles document loading and vector store creation."""
     
-    # Create a prompt for risk analysis
-    prompt = f"""Based ONLY on the following clauses, summarize potential red flags or one-sided terms. Focus on terms that may be disadvantageous to the person signing.
+    @staticmethod
+    def load_and_split_document(filepath: str) -> tuple[str, list]:
+        """Load PDF and split into chunks."""
+        loader = PyMuPDFLoader(filepath)
+        documents = loader.load()
+        full_text = " ".join([doc.page_content for doc in documents])
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, 
+            chunk_overlap=CHUNK_OVERLAP
+        )
+        chunks = text_splitter.split_documents(documents)
+        
+        return full_text, chunks
+    
+    @staticmethod
+    def create_vector_store(chunks: list, namespace: str) -> FAISS:
+        """Create and store FAISS vector store."""
+        vector_store = FAISS.from_documents(chunks, embeddings)
+        vector_stores[namespace] = vector_store
+        logger.info(f"Successfully created FAISS index for {namespace}")
+        return vector_store
 
-    Extracted Clauses:
-    ---
-    {clauses_text}
-    ---
-    """
-    return analysis_llm.predict(prompt)
+class AIAnalyzer:
+    """Handles AI-powered analysis tasks."""
+    
+    @staticmethod
+    def get_summary_and_key_data(full_document_text: str) -> Dict[str, Any]:
+        """Extract summary and key data from document."""
+        prompt = SUMMARY_PROMPT_TEMPLATE.format(document_text=full_document_text)
+        
+        try:
+            logger.info("Generating document summary and key data")
+            response_content = analysis_llm.invoke(prompt).content
+            result = parse_json_response(response_content)
+            logger.info("Successfully generated summary and key data")
+            return result
+        except Exception as e:
+            logger.error(f"Error generating summary: {str(e)}")
+            return create_error_response(str(e))
+    
+    @staticmethod
+    def analyze_single_clause(retriever, topic_query: str) -> Dict[str, Any]:
+        """Analyze a single clause topic."""
+        try:
+            json_llm = ChatOpenAI(
+                openai_api_key=OPENAI_API_KEY, 
+                model=ANALYSIS_MODEL, 
+                temperature=ANALYSIS_TEMPERATURE,
+                model_kwargs={"response_format": {"type": "json_object"}}
+            )
+            
+            parser = PydanticOutputParser(pydantic_object=ClauseAnalysis)
+            prompt_template = PromptTemplate(
+                template=CLAUSE_ANALYSIS_TEMPLATE,
+                input_variables=["topic_query", "context_text"],
+                partial_variables={"format_instructions": parser.get_format_instructions()},
+            )
+            
+            chain = prompt_template | json_llm | parser
+            
+            retrieved_docs = retriever.invoke(topic_query)
+            context_text = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
+            
+            response_object = chain.invoke({
+                "topic_query": topic_query,
+                "context_text": context_text
+            })
+            
+            return response_object.dict()
+        except Exception as e:
+            logger.error(f"Failed to analyze topic '{topic_query}': {str(e)}")
+            return {"error": f"Failed to generate AI analysis for topic: {topic_query}"}
 
-def get_final_assessment(full_document_text, red_flags_summary):
-    """Performs a meta-analysis to generate a confidence score and recommendation."""
-    # Create a prompt for final assessment
-    prompt = f"""Based on the complexity of the original document and the severity of identified red flags, provide a final assessment.
-    Return ONLY a valid JSON object with keys: "complexity_score" (1-10), "confidence_score" (0-100), "recommend_lawyer" (boolean), "recommendation_reason" (string).
+class QuestionAnswering:
+    """Handles Q&A functionality."""
+    
+    @staticmethod
+    def ask_question(query: str, namespace: str) -> str:
+        """Answer question about processed document."""
+        if not namespace:
+            return "Error: No document namespace provided."
 
-    Original Document Snippet:
-    ---
-    {full_document_text[:4000]}
-    ---
-    Summary of Red Flags:
-    ---
-    {red_flags_summary}
-    ---
-    """
-    assessment_json_string = analysis_llm.predict(prompt)
+        vector_store = vector_stores.get(namespace)
+        if not vector_store:
+            return "Error: Document has not been processed or session has expired."
+
+        try:
+            retriever = vector_store.as_retriever()
+            
+            QA_PROMPT = PromptTemplate(
+                template=QA_PROMPT_TEMPLATE, 
+                input_variables=["context", "question"]
+            )
+
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=extraction_llm,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": QA_PROMPT}
+            )
+
+            logger.info(f"Processing question: {query[:50]}...")
+            response = qa_chain.invoke({"query": query})
+            answer = response.get('result', 'No answer found.')
+            logger.info("Successfully processed question")
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error processing question: {str(e)}")
+            return f"Error processing question: {str(e)}"
+
+# Main public functions (keeping original API)
+def setup_and_process_document(filepath: str) -> Dict[str, Any]:
+    """Orchestrates the entire document processing and analysis workflow."""
     try:
-        return json.loads(assessment_json_string)
-    except json.JSONDecodeError:
-        return {"error": "Failed to parse the assessment."}
+        logger.info(f"Starting document processing for: {filepath}")
+        
+        # Process document
+        full_text, chunks = DocumentProcessor.load_and_split_document(filepath)
+        doc_namespace = os.path.basename(filepath)
+        
+        # Create vector store
+        DocumentProcessor.create_vector_store(chunks, doc_namespace)
+        
+        # Generate summary
+        summary_data = AIAnalyzer.get_summary_and_key_data(full_text)
+        
+        result = {
+            "summary": summary_data,
+            "namespace": doc_namespace
+        }
+        
+        logger.info(f"Document processing completed successfully for: {doc_namespace}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Document processing failed: {str(e)}")
+        return {"error": f"Document processing failed: {str(e)}"}
 
-# --- MAIN PUBLIC FUNCTIONS ---
+def analyze_clauses_and_risks(namespace: str) -> Dict[str, Any]:
+    """Analyze key clauses and risks for processed document."""
+    if namespace not in vector_stores:
+        logger.error(f"Namespace '{namespace}' not found")
+        return {"error": f"Document namespace '{namespace}' has not been processed."}
 
-def setup_and_process_document(filepath):
-    """
-    Orchestrates the entire document processing and analysis workflow.
-    This is the main function to be called by the Flask app.
-    """
-    # 1. Load and Chunk Document
-    loader = PyMuPDFLoader(filepath)
-    documents = loader.load()
-    full_text = " ".join([doc.page_content for doc in documents])
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = text_splitter.split_documents(documents)
+    try:
+        vector_store = vector_stores[namespace]
+        retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})
 
-    # 2. Create or Update Pinecone Index
-    # Using the filepath as a namespace allows us to keep multiple docs in one index
-    doc_namespace = os.path.basename(filepath)
-    if INDEX_NAME not in pinecone.list_indexes():
-        pinecone.create_index(name=INDEX_NAME, dimension=1536, metric='cosine')
+        analysis_results = {}
+        for json_key, topic_query in CLAUSE_TOPICS.items():
+            logger.info(f"Analyzing topic: {topic_query}")
+            analysis_results[json_key] = AIAnalyzer.analyze_single_clause(retriever, topic_query)
+                
+        return analysis_results
+        
+    except Exception as e:
+        logger.error(f"Clause analysis failed for namespace '{namespace}': {str(e)}")
+        return {"error": f"Clause analysis failed: {str(e)}"}
 
-    Pinecone.from_documents(chunks, embeddings, index_name=INDEX_NAME, namespace=doc_namespace)
-    vector_store = Pinecone.from_existing_index(index_name=INDEX_NAME, embedding=embeddings, namespace=doc_namespace)
-    retriever = vector_store.as_retriever()
-
-    # 3. Run the Analysis Chain
-    summary = get_simple_summary(full_text)
-    highlighted_clauses = highlight_key_clauses(retriever)
-    clauses_text_for_analysis = "\n\n".join(f"Topic: {k}\nClause: {v}" for k, v in highlighted_clauses.items())
-    red_flags = analyze_for_red_flags(clauses_text_for_analysis)
-    final_assessment = get_final_assessment(full_text, red_flags)
-
-    # 4. Compile and Return Results
-    return {
-        "summary": summary,
-        "namespace": doc_namespace,
-        "highlighted_clauses": highlighted_clauses,
-        "red_flags_summary": red_flags,
-        "final_assessment": final_assessment
-    }
-
-def ask_question(query, namespace):
-    """Handles follow-up Q&A for a specific, already-processed document."""
-    # Validate namespace parameter
-    if not namespace:
-        return "Error: No document namespace provided."
-
-    # Create retriever for the specified document
-    vector_store = Pinecone.from_existing_index(index_name=INDEX_NAME, embedding=embeddings, namespace=namespace)
-    retriever = vector_store.as_retriever()
-    qa_chain = RetrievalQA.from_chain_type(llm=extraction_llm, chain_type="stuff", retriever=retriever)
-
-    return qa_chain.run(query)
+def ask_question(query: str, namespace: str) -> str:
+    """Handle follow-up Q&A for processed document."""
+    return QuestionAnswering.ask_question(query, namespace)
